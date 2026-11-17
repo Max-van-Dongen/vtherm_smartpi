@@ -80,6 +80,8 @@ def _build_control(algo: SmartPI) -> Dict[str, Any]:
 
 def _build_power(algo: SmartPI) -> Dict[str, Any]:
     """Return the command chain in percent."""
+    opening = algo.pulse_opening
+    delivered = algo.pulse_estimated_delivery
     return {
         "current_cycle_percent": _percent(algo.committed_on_percent),
         "next_cycle_percent": _percent(algo.on_percent),
@@ -89,6 +91,8 @@ def _build_power(algo: SmartPI) -> Dict[str, Any]:
             "learning_paused": algo._flow_learning_blocked,
             "reason": algo._flow_reason,
             "reference_demand_percent": _percent(algo.linear_on_percent),
+            "pulse_opening_percent": None if opening is None else _percent(opening),
+            "estimated_pulse_heat_percent": None if delivered is None else _percent(delivered),
         },
         "linear_current_cycle_percent": _percent(algo.linear_committed_on_percent),
         "linear_next_cycle_percent": _percent(algo.linear_on_percent),

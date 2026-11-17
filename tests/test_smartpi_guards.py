@@ -40,6 +40,7 @@ def _make_algo(guard_cut=GuardAction.NONE, guard_kick=GuardAction.NONE, on_perce
     algo.guards.check_guard_cut.return_value = guard_cut
     algo.guards.check_guard_kick.return_value = guard_kick
     algo.on_percent = on_percent
+    algo.pulse_opening = None
     type(algo).calibration_state = PropertyMock(return_value=SmartPICalibrationPhase.IDLE)
     # phase must not equal CALIBRATION or HYSTERESIS so guard-forced value is not masked
     type(algo).phase = PropertyMock(return_value=SmartPIPhase.STABLE)

@@ -123,7 +123,7 @@ from .smartpi.command_ownership import (
 from .smartpi.tint_filter import AdaptiveTintFilter
 from .smartpi.resume_hold import ResumeDeadtimeHold, ResumeHoldSource
 from .smartpi.valve_curve import ValveCurveParams, build_valve_curve
-from .smartpi.boiler_flow import FlowValveCurve, capacity_ratio
+from .smartpi.boiler_flow import MIN_COMMAND_CAPACITY, FlowValveCurve, emission_ratio
 from .smartpi.const import ENABLE_ADAPTIVE_TINT_FILTER
 from .smartpi.timestamp_utils import (
     elapsed_wall_minutes,
@@ -154,6 +154,7 @@ class SmartPI:
     """
 
     boiler_flow_protocol = 1
+    boiler_pulse_protocol = 1
 
     def __init__(
         self,
@@ -194,6 +195,8 @@ class SmartPI:
         self._flow_active = False
         self._flow_learning_blocked = False
         self._flow_reason = "disabled"
+        self._pulse_opening: float | None = None
+        self._pulse_heat: float | None = None
         self._valve_mode_enabled = bool(enable_valve_linearization)
         # VT valve settings seen by SmartPI; set by the handler in valve mode.
         self.valve_config_diag: dict[str, Any] | None = None
@@ -830,6 +833,9 @@ class SmartPI:
     def _linear_max_on(self) -> float | None:
         """Return max_on_percent, an actuator limit in VT, in linear demand space."""
         cap = self._max_on_percent
+        if self._pulse_opening is not None:
+            # Retain demand in reference units even while delivery is constrained.
+            return self.valve_curve.base.invert(1.0 if cap is None else cap)
         if self._flow_active:
             return self.valve_curve.invert(1.0 if cap is None else cap)
         return self.valve_curve.invert(cap) if cap is not None and self.valve_curve.params else cap
@@ -843,6 +849,7 @@ class SmartPI:
         return {
             "demand": self._on_percent,
             "target_capacity": self.valve_curve.base.invert(opening),
+            "pulse_eligible": self._pulse_eligible(),
             "reference_required": (
                 not self._valve_mode_enabled
                 or (self._on_percent > 0 and self.phase != SmartPIPhase.STABLE)
@@ -850,6 +857,31 @@ class SmartPI:
                 or self.calibration_mgr.calibration_requested
             ),
         }
+
+    def _pulse_eligible(self) -> bool:
+        """Whether the coordinator may take ownership of this zone's valve."""
+        return (
+            self._valve_mode_enabled
+            and self.phase == SmartPIPhase.STABLE
+            and not self.calibration_mgr.calibration_requested
+            and not self.vt_safety_override
+            and not self.guards.guard_cut_active
+            and not self.guards.guard_kick_active
+            and (self._max_on_percent is None or self._max_on_percent >= 1.0)
+            and (self.valve_curve.params is None or self.valve_curve.params.max_valve >= 100.0)
+        )
+
+    @property
+    def pulse_opening(self) -> float | None:
+        """Current coordinated valve override; native guards take precedence."""
+        if self._pulse_opening is not None and self._pulse_eligible():
+            return self._pulse_opening
+        return None
+
+    @property
+    def pulse_estimated_delivery(self) -> float | None:
+        """Estimated normalized emitter power using water and reported opening."""
+        return self._pulse_heat if self._pulse_opening is not None else None
 
     def set_boiler_context(self, context, room_temperature, hvac_mode) -> None:
         """Compensate commands and realized feedback without changing learned A/B.
@@ -864,6 +896,7 @@ class SmartPI:
             and hvac_mode == VThermHvacMode_HEAT
         )
         scale, blocked, reason = 1.0, False, "disabled"
+        opening = estimated_heat = None
         if active:
             try:
                 if (
@@ -871,13 +904,28 @@ class SmartPI:
                     or not 0 <= time.monotonic() - float(context["observed_at"]) <= 180
                 ):
                     raise ValueError("stale context")
-                scale = capacity_ratio(
+                emission = emission_ratio(
                     float(context["flow_temperature"]),
                     float(context["reference_temperature"]),
                     float(room_temperature),
                     float(context["exponent"]),
                 )
-                if context.get("boiler_active") is False:
+                scale = max(MIN_COMMAND_CAPACITY, emission)
+                directive = context.get("pulse_opening")
+                if (
+                    type(directive) in (int, float)
+                    and directive in (0, 1)
+                    and isinstance(context.get("boiler_active"), bool)
+                    and self._pulse_eligible()
+                ):
+                    opening = float(directive)
+                    reported = context.get("pulse_valve_feedback")
+                    if not context["boiler_active"]:
+                        # The twin's delayed history carries previously delivered heat.
+                        estimated_heat = 0.0
+                    elif type(reported) in (int, float) and 0 <= reported <= 1:
+                        estimated_heat = self.valve_curve.base.invert(reported) * emission
+                if opening is None and context.get("boiler_active") is False:
                     # A closed circuit's cooling measurements do not depend on
                     # boiler water temperature. Keep passive B learning possible
                     # at a settled reference; context still blocks modulation.
@@ -888,6 +936,8 @@ class SmartPI:
                     if scale < 0.999
                     else str(context.get("reason", "reference"))
                 )
+                if opening is not None:
+                    blocked, reason = True, "boiler_pulse"
             except (ValueError, TypeError, KeyError):
                 scale, blocked, reason = (
                     self.valve_curve.scale,
@@ -898,13 +948,19 @@ class SmartPI:
             abs(scale - self.valve_curve.scale) > 1e-6
             or blocked != self._flow_learning_blocked
             or active != self._flow_active
+            or opening != self._pulse_opening
         )
+        self._pulse_opening = opening
+        delivery_changed = self._pulse_heat != estimated_heat
+        self._pulse_heat = estimated_heat
         self._flow_active, self._flow_learning_blocked, self._flow_reason = (
             active,
             blocked,
             reason,
         )
         if not changed:
+            if delivery_changed and opening is not None:
+                self._set_committed_actuator_output(self._actuator_committed_on_percent)
             return
         self.valve_curve.scale = scale
         # Retain the physical feedback. Reinterpret it in the new heat units.
@@ -950,7 +1006,11 @@ class SmartPI:
     def _set_committed_actuator_output(self, actuator_power: float) -> float:
         """Commit an actuator command and return its linear equivalent."""
         self._actuator_committed_on_percent = clamp(actuator_power, 0.0, 1.0)
-        linear_power = self._to_linear_power(self._actuator_committed_on_percent)
+        if self._pulse_opening is None:
+            linear_power = self._to_linear_power(self._actuator_committed_on_percent)
+        else:
+            # Scheduler receipts can arrive before the physical TRV moves.
+            linear_power = self.pulse_estimated_delivery or 0.0
         self._committed_on_percent = linear_power
         self.u_prev = linear_power
         self._last_u_applied = linear_power
@@ -966,7 +1026,8 @@ class SmartPI:
 
     @property
     def on_percent(self) -> float:
-        return self._to_actuator_power(self._on_percent)
+        opening = self.pulse_opening
+        return self._to_actuator_power(self._on_percent) if opening is None else opening
 
     @property
     def calculated_on_percent(self) -> float:
@@ -974,6 +1035,8 @@ class SmartPI:
 
     @property
     def committed_on_percent(self) -> float:
+        if self._pulse_opening is not None:
+            return self._actuator_committed_on_percent
         return self._to_actuator_power(self._committed_on_percent)
 
     @property
@@ -1994,6 +2057,7 @@ class SmartPI:
 
         # --- 1. Validation & Handle OFF ---
         if self._validate_and_handle_off(target_temp, current_temp, hvac_mode, power_shedding, off_reason):
+            self._pulse_opening = None
             return
 
         self.guards.sensor_step_c = self.learn_win.balance.resolution_c
@@ -2260,6 +2324,8 @@ class SmartPI:
             integrator_hold, integrator_hold_source = True, "governance_sensor_invalid"
         if self.vt_safety_override:  # the PI does not drive the actuator
             integrator_hold, integrator_hold_source = True, "vt_safety"
+        if self.pulse_opening is not None:
+            integrator_hold, integrator_hold_source = True, "boiler_pulse"
 
         # Deadband ENTRY: no bumpless transfer. The integral keeps its
         # naturally accumulated value and is simply frozen by compute_pwm.
@@ -2292,7 +2358,8 @@ class SmartPI:
 
         # Anti-windup on the limit known at this tick (max_on_percent).
         # Rate limit and timing quantization are not saturations.
-        self.ctl.track_output_limit(u_max, self.Kp, self.Ki, dt_min)
+        if self.pulse_opening is None:
+            self.ctl.track_output_limit(u_max, self.Kp, self.Ki, dt_min)
 
         # --- 12. Soft Constraints ---
         u_limited = self._apply_soft_constraints(u_cmd, dt_min, setpoint_changed)
@@ -2350,11 +2417,15 @@ class SmartPI:
     ) -> None:
         """Update thermal twin and compute ETA best-case (diagnostics-only)."""
         mode = "heat" if hvac_mode == VThermHvacMode_HEAT else "cool"
+        if self._pulse_opening is None:
+            applied = self._on_percent
+        else:
+            applied = self.pulse_estimated_delivery or 0.0
         self._last_twin_diag = self.twin.update_with_eta(
             tin=current_temp,
             text=ext_current_temp,
             target=target_temp,
-            on_percent=self._on_percent,
+            on_percent=applied,
             tau_reliable=self._tau_reliable,
             a=self.est.a,
             b=self.est.b,

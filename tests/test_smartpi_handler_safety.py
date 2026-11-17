@@ -18,10 +18,13 @@ from custom_components.vtherm_smartpi.smartpi.guards import GuardAction
 from fakes.fake_cycle_scheduler import FakeReceiptCycleScheduler
 from helpers import force_smartpi_stable_mode, make_receipt
 
+from test_boiler_flow import context
 
-def _make_handler(thermostat, receipts: bool = True) -> tuple[SmartPIHandler, SmartPI]:
+
+def _make_handler(thermostat, receipts: bool = True, valve_mode: bool = False) -> tuple[SmartPIHandler, SmartPI]:
     if receipts:
         thermostat.cycle_scheduler = FakeReceiptCycleScheduler()
+    thermostat.cycle_scheduler.is_valve_mode = valve_mode
     handler = SmartPIHandler(thermostat)
     handler.init_algorithm()
     handler.on_scheduler_ready(thermostat.cycle_scheduler)
@@ -71,6 +74,36 @@ async def test_normal_mode_applies_and_owns_the_smartpi_request(fake_handler_run
     assert binding.status == CommandOwnershipBindingStatus.BOUND
     assert binding.request_id == start.kwargs["request_id"]
     assert binding.snapshot is not None
+
+
+@pytest.mark.asyncio
+async def test_pulse_transitions_apply_immediately_and_preserve_raw_request(fake_handler_runtime):
+    thermostat = fake_handler_runtime
+    handler, algo = _make_handler(thermostat, valve_mode=True)
+    scheduler = thermostat.cycle_scheduler
+    await _control(handler, algo)
+
+    # No forced restart on a repeated command, even when a new reading arrives.
+    for opening, feedback, force in ((1, 0, True), (1, 1, False), (0, 1, True), (0, 0, False)):
+        thermostat.boiler_flow_context = {
+            **context(flow=55, reference=55),
+            "pulse_opening": opening,
+            "pulse_valve_feedback": feedback,
+            "boiler_active": bool(opening),
+        }
+        await _control(handler, algo)
+        start = scheduler.start_cycle.await_args
+        assert start.args == (VThermHvacMode_HEAT, opening, force)
+        assert "request_id" not in start.kwargs
+        assert algo.boiler_heat_request(0.9)["demand"] == pytest.approx(0.6)
+        assert algo.linear_committed_on_percent == pytest.approx(feedback * opening)
+
+    thermostat.boiler_flow_context = None
+    await _control(handler, algo)
+    resumed = scheduler.start_cycle.await_args
+    assert resumed.args == (VThermHvacMode_HEAT, 0.6, True)
+    assert resumed.kwargs["request_id"] is not None
+    assert algo.linear_committed_on_percent == pytest.approx(0.6)
 
 
 @pytest.mark.asyncio

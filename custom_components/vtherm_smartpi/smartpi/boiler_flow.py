@@ -9,7 +9,10 @@ from math import isfinite
 from .valve_curve import clamp_unit
 
 
-def capacity_ratio(
+MIN_COMMAND_CAPACITY = 0.05
+
+
+def emission_ratio(
     flow: float, reference: float, room: float, exponent: float
 ) -> float:
     """Approximate relative heat capacity using the supply-to-room temperature head."""
@@ -19,7 +22,12 @@ def capacity_ratio(
         raise ValueError("Invalid boiler reference or exponent")
     # The controller never selects a flow above its reference. A hot overshoot
     # uses scale=1 conservatively rather than expanding SmartPI's 0..1 model.
-    return min(1.0, max(0.05, (max(0.0, flow - room) / (reference - room)) ** exponent))
+    return min(1.0, (max(0.0, flow - room) / (reference - room)) ** exponent)
+
+
+def capacity_ratio(flow: float, reference: float, room: float, exponent: float) -> float:
+    """Keep the command mapping invertible even when the radiator is cold."""
+    return max(MIN_COMMAND_CAPACITY, emission_ratio(flow, reference, room, exponent))
 
 
 class FlowValveCurve:

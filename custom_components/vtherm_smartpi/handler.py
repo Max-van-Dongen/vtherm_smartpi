@@ -71,6 +71,7 @@ class SmartPIHandler:
         self._last_publish_signature = None
         self._pending_publish_signature = None
         self._allow_pwm_cycle_force: bool = False
+        self._last_pulse_opening: float | None = None
         self._valve_linearization_configured: bool = False
         self._valve_curve_params: ValveCurveParams | None = None
 
@@ -335,6 +336,8 @@ class SmartPIHandler:
 
         algo = t.prop_algorithm if isinstance(t.prop_algorithm, SmartPI) else None
         if algo is not None:
+            safety = getattr(getattr(t, "safety_manager", None), "is_safety_detected", False)
+            algo.vt_safety_override = safety is True
             algo.set_boiler_context(
                 getattr(t, "boiler_flow_context", None),
                 t.current_temperature,
@@ -400,8 +403,6 @@ class SmartPIHandler:
                 or t.cycle_scheduler is None
                 or not t.cycle_scheduler.is_cycle_running
             )
-            safety = getattr(getattr(t, "safety_manager", None), "is_safety_detected", False)
-            algo.vt_safety_override = safety is True
             t.prop_algorithm.calculate(
                 target_temp=t.target_temperature,
                 current_temp=t.current_temperature,
@@ -440,6 +441,7 @@ class SmartPIHandler:
 
         # Stop here if we are off
         if t.vtherm_hvac_mode == VThermHvacMode_OFF:
+            self._last_pulse_opening = None
             _LOGGER.debug("%s - End of cycle (HVAC_MODE_OFF)", t)
             setattr(t, "_on_time_sec", 0)
             setattr(t, "_off_time_sec", int(t.cycle_min * 60))
@@ -456,8 +458,11 @@ class SmartPIHandler:
             on_percent_changed = abs(on_percent - self._last_on_percent) > 0.001
             self._last_on_percent = on_percent
             was_cycle_running = bool(getattr(t.cycle_scheduler, "is_cycle_running", False))
+            pulse_opening = algo.pulse_opening if isinstance(algo, SmartPI) else None
+            pulse_changed = pulse_opening != self._last_pulse_opening
             force_cycle = (
                 force
+                or pulse_changed
                 or (t.prop_algorithm.phase == SmartPIPhase.CALIBRATION)
                 or (t.prop_algorithm.phase == SmartPIPhase.HYSTERESIS and on_percent_changed)
             )
@@ -468,7 +473,7 @@ class SmartPIHandler:
                 if abs(on_percent - algo.on_percent) > 1e-6:
                     # VT override (e.g. safety default): not owned by the SmartPI request.
                     algo.reset_command_ownership("runtime_power_override")
-                elif self._receipt_remove is not None:
+                elif self._receipt_remove is not None and pulse_opening is None:
                     request_kwargs = {"request_id": algo.stage_command(t.vtherm_hvac_mode)}
 
             await t.cycle_scheduler.start_cycle(
@@ -477,6 +482,8 @@ class SmartPIHandler:
                 force_cycle,
                 **request_kwargs,
             )
+            self._last_pulse_opening = pulse_opening
+            self._should_publish_intermediate |= pulse_changed
             if (
                 algo is not None
                 and self._receipt_remove is None
