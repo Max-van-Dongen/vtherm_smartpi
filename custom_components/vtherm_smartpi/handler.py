@@ -334,6 +334,12 @@ class SmartPIHandler:
         from .smartpi.guards import GuardAction
 
         algo = t.prop_algorithm if isinstance(t.prop_algorithm, SmartPI) else None
+        if algo is not None:
+            algo.set_boiler_context(
+                getattr(t, "boiler_flow_context", None),
+                t.current_temperature,
+                t.vtherm_hvac_mode,
+            )
         previous_committed = algo.committed_on_percent if algo is not None else None
         self._pending_publish_signature = self._build_publish_signature()
         input_changed = self._pending_publish_signature != self._last_publish_signature
@@ -513,11 +519,15 @@ class SmartPIHandler:
                     self._fire_autocalib_event(ac_event)
 
             # Hourly stagnation check
-            ac_event = algo.autocalib.check_hourly(
-                now_wall=now_wall,
-                algo=algo,
-                ext_temp=t.current_outdoor_temperature,
-                current_temp=t.current_temperature,
+            ac_event = (
+                None
+                if getattr(algo, "_flow_learning_blocked", False) is True
+                else algo.autocalib.check_hourly(
+                    now_wall=now_wall,
+                    algo=algo,
+                    ext_temp=t.current_outdoor_temperature,
+                    current_temp=t.current_temperature,
+                )
             )
             if ac_event is not None:
                 self._fire_autocalib_event(ac_event)

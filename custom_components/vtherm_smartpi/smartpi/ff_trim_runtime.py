@@ -95,6 +95,10 @@ class FFTrimCoordinator:
         """Count down the reboot freeze, then freeze or release the trim for this tick."""
         spi = self._spi
         # Post-reboot freeze countdown
+        if spi._flow_learning_blocked:
+            spi._ff_trim.freeze("boiler_flow")
+            self.pending_persistent = None
+            return
         if self.reboot_freeze_remaining > 0:
             self.reboot_freeze_remaining -= 1
             if self.reboot_freeze_remaining == 0:
@@ -390,6 +394,11 @@ class FFTrimCoordinator:
     ) -> bool:
         """Route an observer result through the persistent trim safeguards."""
         spi = self._spi
+        if spi._flow_learning_blocked:
+            self.pending_persistent = None
+            spi._ff_trim.clear_pending()
+            self.last_reject_reason = "boiler_flow"
+            return False
         observation_mode = result.observation_mode
         self.observation_mode = observation_mode
         if not result.admissible:
@@ -622,6 +631,8 @@ class FFTrimCoordinator:
     def current_bumpless_context_rejection(self) -> str | None:
         """Revalidate strict deadband ownership at the mutation instant."""
         spi = self._spi
+        if spi._flow_learning_blocked:
+            return "boiler_flow"
         if spi.gov.regime != GovernanceRegime.DEAD_BAND:
             return "application_not_deadband"
         if not is_deadband_neutral_integral(

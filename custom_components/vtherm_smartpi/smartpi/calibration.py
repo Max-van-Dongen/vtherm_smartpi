@@ -58,7 +58,7 @@ class CalibrationManager:
             name: Entity name for logging
         """
         self._name = name
-        
+
         # State variables
         self._last_calibration_time: float | None = None
         self._calibration_state: SmartPICalibrationPhase = SmartPICalibrationPhase.IDLE
@@ -244,6 +244,7 @@ class CalibrationManager:
         max_on_percent: float | None,
         twin_diag: dict | None = None,
         filtered_temp: float | None = None,
+        learning_allowed: bool = True,
     ) -> CalibrationResult:
         """
         Execute calibration state machine.
@@ -270,7 +271,7 @@ class CalibrationManager:
                 result=self._calibration_result,
                 message="idle",
             )
-        
+
         # Safety/Exit conditions - HVAC OFF
         if hvac_mode == VThermHvacMode_OFF:
             self._calibration_state = SmartPICalibrationPhase.IDLE
@@ -287,7 +288,7 @@ class CalibrationManager:
         is_cool = (hvac_mode == VThermHvacMode_COOL)
         on_low = 1.0 if is_cool else 0.0
         on_high = 0.0 if is_cool else 1.0
-        
+
         unreachable_phase = self._unreachable_phase(
             target_temp, current_temp, is_cool, twin_diag, max_on_percent
         )
@@ -340,7 +341,7 @@ class CalibrationManager:
                 self._calibration_result = SmartPICalibrationResult.SUCCESS
                 self._completed_result = self._calibration_result
                 message = "completed"
-                
+
                 # Check success (logging)
                 if not dt_est.deadtime_heat_reliable:
                     _LOGGER.warning("%s - Calibration finished but DeadTime still unreliable.", self._name)
@@ -355,7 +356,7 @@ class CalibrationManager:
         # The detection runs on the filtered temperature, as in regulation: a
         # raw reading flickering by one sensor step would detect a response at
         # the power step. The raw reading feeds the slope history.
-        if current_temp is not None:
+        if current_temp is not None and learning_allowed:
             dt_est.update(
                 now=time.monotonic(),
                 tin=current_temp if filtered_temp is None else filtered_temp,
@@ -379,7 +380,7 @@ class CalibrationManager:
             state: Dictionary containing calibration state
         """
         self._last_calibration_time = state.get("last_calibration_time")
-        
+
         # Load calibration state enum
         calibration_state_str = state.get("calibration_state")
         if calibration_state_str:
@@ -389,10 +390,10 @@ class CalibrationManager:
                 self._calibration_state = SmartPICalibrationPhase.IDLE
         else:
             self._calibration_state = SmartPICalibrationPhase.IDLE
-            
+
         self._calibration_start_time = wall_to_monotonic_ts(state.get("calibration_start_time"))
         self._force_calibration_requested = state.get("force_calibration_requested", False)
-        
+
         calibration_result_str = state.get("calibration_result")
         if calibration_result_str:
             try:

@@ -83,6 +83,13 @@ def _build_power(algo: SmartPI) -> Dict[str, Any]:
     return {
         "current_cycle_percent": _percent(algo.committed_on_percent),
         "next_cycle_percent": _percent(algo.on_percent),
+        "boiler_flow": {
+            "active": algo._flow_active,
+            "capacity_ratio": round(algo.valve_curve.scale, 4),
+            "learning_paused": algo._flow_learning_blocked,
+            "reason": algo._flow_reason,
+            "reference_demand_percent": _percent(algo.linear_on_percent),
+        },
         "linear_current_cycle_percent": _percent(algo.linear_committed_on_percent),
         "linear_next_cycle_percent": _percent(algo.linear_on_percent),
         "valve_linearization_enabled": algo.valve_curve.params is not None,

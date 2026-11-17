@@ -123,6 +123,7 @@ from .smartpi.command_ownership import (
 from .smartpi.tint_filter import AdaptiveTintFilter
 from .smartpi.resume_hold import ResumeDeadtimeHold, ResumeHoldSource
 from .smartpi.valve_curve import ValveCurveParams, build_valve_curve
+from .smartpi.boiler_flow import FlowValveCurve, capacity_ratio
 from .smartpi.const import ENABLE_ADAPTIVE_TINT_FILTER
 from .smartpi.timestamp_utils import (
     elapsed_wall_minutes,
@@ -151,6 +152,8 @@ class SmartPI:
       accepting a slower approach to target.
     - Keep computational footprint small; no external libs.
     """
+
+    boiler_flow_protocol = 1
 
     def __init__(
         self,
@@ -187,6 +190,10 @@ class SmartPI:
             enable_valve_linearization,
             valve_curve_params,
         )
+        self.valve_curve = FlowValveCurve(self.valve_curve)
+        self._flow_active = False
+        self._flow_learning_blocked = False
+        self._flow_reason = "disabled"
         self._valve_mode_enabled = bool(enable_valve_linearization)
         # VT valve settings seen by SmartPI; set by the handler in valve mode.
         self.valve_config_diag: dict[str, Any] | None = None
@@ -549,7 +556,7 @@ class SmartPI:
         """
         now = time.monotonic()
 
-        if not self._learning_enabled:
+        if not self._learning_enabled or self._flow_learning_blocked:
             return
 
         if a_learning_block_reason is None and setpoint_changed:
@@ -823,7 +830,92 @@ class SmartPI:
     def _linear_max_on(self) -> float | None:
         """Return max_on_percent, an actuator limit in VT, in linear demand space."""
         cap = self._max_on_percent
+        if self._flow_active:
+            return self.valve_curve.invert(1.0 if cap is None else cap)
         return self.valve_curve.invert(cap) if cap is not None and self.valve_curve.params else cap
+
+    def boiler_heat_request(self, target_opening: float) -> dict:
+        """Version-1 request in heat units, never compensated valve percentages."""
+        opening = min(
+            target_opening,
+            self._max_on_percent if self._max_on_percent is not None else 1.0,
+        )
+        return {
+            "demand": self._on_percent,
+            "target_capacity": self.valve_curve.base.invert(opening),
+            "reference_required": (
+                not self._valve_mode_enabled
+                or (self._on_percent > 0 and self.phase != SmartPIPhase.STABLE)
+                or self.calibration_mgr.is_calibrating
+                or self.calibration_mgr.calibration_requested
+            ),
+        }
+
+    def set_boiler_context(self, context, room_temperature, hvac_mode) -> None:
+        """Compensate commands and realized feedback without changing learned A/B.
+
+        In-flight learning/FF windows are discarded when the heat mapping
+        changes. Identification only resumes at a settled reference temperature.
+        An expired/invalid context freezes learning and holds the last mapping.
+        """
+        active = (
+            isinstance(context, dict)
+            and self._valve_mode_enabled
+            and hvac_mode == VThermHvacMode_HEAT
+        )
+        scale, blocked, reason = 1.0, False, "disabled"
+        if active:
+            try:
+                if (
+                    context.get("version") != 1
+                    or not 0 <= time.monotonic() - float(context["observed_at"]) <= 180
+                ):
+                    raise ValueError("stale context")
+                scale = capacity_ratio(
+                    float(context["flow_temperature"]),
+                    float(context["reference_temperature"]),
+                    float(room_temperature),
+                    float(context["exponent"]),
+                )
+                if context.get("boiler_active") is False:
+                    # A closed circuit's cooling measurements do not depend on
+                    # boiler water temperature. Keep passive B learning possible
+                    # at a settled reference; context still blocks modulation.
+                    scale = 1.0
+                blocked = context.get("learning_allowed") is not True or scale < 0.999
+                reason = (
+                    "modulated_flow"
+                    if scale < 0.999
+                    else str(context.get("reason", "reference"))
+                )
+            except (ValueError, TypeError, KeyError):
+                scale, blocked, reason = (
+                    self.valve_curve.scale,
+                    True,
+                    "invalid_or_stale_flow",
+                )
+        changed = (
+            abs(scale - self.valve_curve.scale) > 1e-6
+            or blocked != self._flow_learning_blocked
+            or active != self._flow_active
+        )
+        self._flow_active, self._flow_learning_blocked, self._flow_reason = (
+            active,
+            blocked,
+            reason,
+        )
+        if not changed:
+            return
+        self.valve_curve.scale = scale
+        # Retain the physical feedback. Reinterpret it in the new heat units.
+        self._set_committed_actuator_output(self._actuator_committed_on_percent)
+        self._sync_actuator_on_percent()
+        self._reset_learning_window()
+        self.dt_est.reset_observation(self._committed_on_percent)
+        self.fftrim_coord.reset_observation_runtime()
+        self.fftrim_coord.pending_persistent = None
+        self._ff_trim.clear_pending()
+        self.reset_command_ownership("boiler_flow_changed")
 
     def configure_valve_linearization(
         self,
@@ -832,7 +924,8 @@ class SmartPI:
         valve_mode: bool | None = None,
     ) -> None:
         """Configure the actuator linearization curve."""
-        self.valve_curve = build_valve_curve(enabled, params)
+        scale = self.valve_curve.scale
+        self.valve_curve = FlowValveCurve(build_valve_curve(enabled, params), scale)
         self._valve_mode_enabled = (
             bool(valve_mode) if valve_mode is not None else bool(enabled)
         )
@@ -1141,6 +1234,7 @@ class SmartPI:
             max_on_percent=self._linear_max_on(),
             twin_diag=self._last_twin_diag,
             filtered_temp=filtered_temp,
+            learning_allowed=not self._flow_learning_blocked,
         )
 
         # Apply result
@@ -1910,7 +2004,11 @@ class SmartPI:
             # detection, the learning and the published temperature follow the cut.
             if current_temp is not None:
                 t_int_lp, t_int_clean = self.tint_filter.update(current_temp, now)
-                if self.phase != SmartPIPhase.HYSTERESIS and not self.calibration_mgr.is_calibrating:
+                if (
+                    self.phase != SmartPIPhase.HYSTERESIS
+                    and not self.calibration_mgr.is_calibrating
+                    and not self._flow_learning_blocked
+                ):
                     self.dt_est.update(
                         now=now,
                         tin=t_int_lp,
@@ -1994,6 +2092,7 @@ class SmartPI:
         # --- 4. Learning & Calibration ---
         if (
             self._learning_enabled
+            and not self._flow_learning_blocked
             and self.phase != SmartPIPhase.HYSTERESIS
             and not self.calibration_mgr.is_calibrating
         ):
@@ -2033,10 +2132,11 @@ class SmartPI:
                 _LOGGER.warning("%s - Calibration timeout after %.1f minutes", self._name, elapsed)
                 self.calibration_mgr.handle_timeout()
 
-        self.calibration_mgr.check_and_start(
-            now=now,
-            phase=self.phase,
-        )
+        if not self._flow_learning_blocked:
+            self.calibration_mgr.check_and_start(
+                now=now,
+                phase=self.phase,
+            )
 
         if self.calibration_mgr.is_calibrating:
             self.fftrim_coord.invalidate_context(
@@ -2082,7 +2182,7 @@ class SmartPI:
             # so commit the bang-bang output now for deadtime tracking.
             self._commit_current_linear_output()
             self._update_deadtime_episode_status(self._committed_on_percent, hvac_mode, now)
-            if self._learning_enabled:
+            if self._learning_enabled and not self._flow_learning_blocked:
                 self.dt_est.update(
                     now=now,
                     tin=t_int_lp,
