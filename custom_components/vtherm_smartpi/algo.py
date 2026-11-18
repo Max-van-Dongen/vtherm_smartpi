@@ -196,6 +196,7 @@ class SmartPI:
         self._flow_learning_blocked = False
         self._flow_reason = "disabled"
         self._pulse_opening: float | None = None
+        self._pulse_recovery = False
         self._pulse_heat: float | None = None
         self._valve_mode_enabled = bool(enable_valve_linearization)
         # VT valve settings seen by SmartPI; set by the handler in valve mode.
@@ -850,6 +851,7 @@ class SmartPI:
             "demand": self._on_percent,
             "target_capacity": self.valve_curve.base.invert(opening),
             "pulse_eligible": self._pulse_eligible(),
+            "recovery_eligible": self._pulse_eligible(full_open_recovery=True),
             "reference_required": (
                 not self._valve_mode_enabled
                 or (self._on_percent > 0 and self.phase != SmartPIPhase.STABLE)
@@ -858,15 +860,15 @@ class SmartPI:
             ),
         }
 
-    def _pulse_eligible(self) -> bool:
-        """Whether the coordinator may take ownership of this zone's valve."""
+    def _pulse_eligible(self, *, full_open_recovery: bool = False) -> bool:
+        """A cold-room guard kick permits a full-open recovery command only."""
         return (
             self._valve_mode_enabled
             and self.phase == SmartPIPhase.STABLE
             and not self.calibration_mgr.calibration_requested
             and not self.vt_safety_override
             and not self.guards.guard_cut_active
-            and not self.guards.guard_kick_active
+            and (not self.guards.guard_kick_active or full_open_recovery)
             and (self._max_on_percent is None or self._max_on_percent >= 1.0)
             and (self.valve_curve.params is None or self.valve_curve.params.max_valve >= 100.0)
         )
@@ -874,7 +876,7 @@ class SmartPI:
     @property
     def pulse_opening(self) -> float | None:
         """Current coordinated valve override; native guards take precedence."""
-        if self._pulse_opening is not None and self._pulse_eligible():
+        if self._pulse_opening is not None and self._pulse_eligible(full_open_recovery=self._pulse_recovery):
             return self._pulse_opening
         return None
 
@@ -897,6 +899,7 @@ class SmartPI:
         )
         scale, blocked, reason = 1.0, False, "disabled"
         opening = estimated_heat = None
+        recovery = False
         if active:
             try:
                 if (
@@ -912,13 +915,15 @@ class SmartPI:
                 )
                 scale = max(MIN_COMMAND_CAPACITY, emission)
                 directive = context.get("pulse_opening")
+                full_open_recovery = context.get("pulse_recovery") is True and directive == 1
                 if (
                     type(directive) in (int, float)
                     and directive in (0, 1)
                     and isinstance(context.get("boiler_active"), bool)
-                    and self._pulse_eligible()
+                    and self._pulse_eligible(full_open_recovery=full_open_recovery)
                 ):
                     opening = float(directive)
+                    recovery = full_open_recovery
                     reported = context.get("pulse_valve_feedback")
                     if not context["boiler_active"]:
                         # The twin's delayed history carries previously delivered heat.
@@ -937,7 +942,7 @@ class SmartPI:
                     else str(context.get("reason", "reference"))
                 )
                 if opening is not None:
-                    blocked, reason = True, "boiler_pulse"
+                    blocked, reason = True, "boiler_recovery" if recovery else "boiler_pulse"
             except (ValueError, TypeError, KeyError):
                 scale, blocked, reason = (
                     self.valve_curve.scale,
@@ -951,6 +956,7 @@ class SmartPI:
             or opening != self._pulse_opening
         )
         self._pulse_opening = opening
+        self._pulse_recovery = recovery
         delivery_changed = self._pulse_heat != estimated_heat
         self._pulse_heat = estimated_heat
         self._flow_active, self._flow_learning_blocked, self._flow_reason = (

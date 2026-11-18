@@ -5,9 +5,11 @@ from unittest.mock import patch
 
 import pytest
 
+from custom_components.vtherm_smartpi.handler import SmartPIHandler
 from custom_components.vtherm_smartpi.hvac_mode import VThermHvacMode_HEAT
 from custom_components.vtherm_smartpi.smartpi.const import AB_MIN_SAMPLES_B
 from custom_components.vtherm_smartpi.smartpi.valve_curve import ValveCurveParams
+from fakes.fake_cycle_scheduler import FakeReceiptCycleScheduler
 
 from .test_boiler_flow import algorithm, context
 
@@ -46,6 +48,63 @@ def test_raw_demand_survives_charge_coast_and_release(stable_room):
     assert room.on_percent == pytest.approx(0.1)
     assert room.est.save_state() == baseline
     assert not room._flow_learning_blocked
+
+
+@pytest.mark.asyncio
+async def test_target_jump_recovery_opens_valve_during_guard_kick(stable_room, fake_handler_runtime):
+    thermostat = fake_handler_runtime
+    thermostat.prop_algorithm = stable_room
+    thermostat.current_temperature = thermostat.target_temperature = 20.5
+    thermostat.cycle_scheduler = FakeReceiptCycleScheduler()
+    thermostat.cycle_scheduler.is_valve_mode = True
+    handler = SmartPIHandler(thermostat)
+    handler.on_scheduler_ready(thermostat.cycle_scheduler)
+    await handler.control_heating()
+
+    # The previous tick was near the old target when the user raised it.
+    stable_room.deadband_mgr.in_near_band = True
+    thermostat.target_temperature = 30.0
+    await handler.control_heating(force=True)
+    request = stable_room.boiler_heat_request(0.9)
+    assert stable_room.guards.guard_kick_active
+    assert request["recovery_eligible"] is True
+    assert request["pulse_eligible"] is False
+    assert request["reference_required"] is False
+
+    thermostat.boiler_flow_context = pulse(1, 0, active=False, pulse_recovery=True)
+    await handler.control_heating()
+    start = thermostat.cycle_scheduler.start_cycle.await_args
+    assert start.args == (VThermHvacMode_HEAT, 1.0, True)
+    assert "request_id" not in start.kwargs
+    assert stable_room.pulse_opening == 1.0
+    assert stable_room.linear_committed_on_percent == 0.0
+
+
+@pytest.mark.parametrize(
+    "next_directive",
+    [
+        {"opening": 0, "pulse_recovery": True},
+        {"opening": 1},
+        {"opening": 1, "pulse_recovery": False},
+        {"opening": 1, "pulse_recovery": 1},
+        {"opening": True, "pulse_recovery": True},
+        None,
+    ],
+)
+def test_only_explicit_full_recovery_overrides_guard_kick(stable_room, next_directive):
+    room = stable_room
+    room.guards._guard_kick_active = True
+    room.set_boiler_context(pulse(1, 0, pulse_recovery=True), 20, VThermHvacMode_HEAT)
+    assert room.pulse_opening == 1.0
+    assert room.on_percent == 1.0
+    assert room.boiler_heat_request(0.9)["demand"] == pytest.approx(0.1)
+
+    message = pulse(feedback=0, **next_directive) if next_directive is not None else None
+    room.set_boiler_context(message, 20, VThermHvacMode_HEAT)
+    assert room.pulse_opening is None
+    assert room.on_percent == room.calculated_on_percent
+    assert 0 < room.on_percent < 1
+    assert room.boiler_heat_request(0.9)["demand"] == pytest.approx(0.1)
 
 
 @pytest.mark.parametrize(
@@ -113,7 +172,8 @@ def test_malformed_directive_releases_valve(stable_room, invalid):
 
 
 @pytest.mark.parametrize(
-    "fault", ["stale", "bootstrap", "safety", "calibration", "limited_valve", "guard_cut", "guard_kick", "valve_curve"]
+    "fault",
+    ["stale", "bootstrap", "safety", "calibration", "limited_valve", "guard_cut", "guard_kick", "valve_curve", "non_valve"],
 )
 def test_lost_eligibility_releases_full_valve_command(stable_room, fault):
     room = stable_room
@@ -134,12 +194,32 @@ def test_lost_eligibility_releases_full_valve_command(stable_room, fault):
         room.guards._guard_kick_active = True
     elif fault == "valve_curve":
         room.configure_valve_linearization(True, ValveCurveParams(7, 80, 15, 70), valve_mode=True)
+    elif fault == "non_valve":
+        room.configure_valve_linearization(False, valve_mode=False)
     else:
         room._max_on_percent = 0.5
     room.set_boiler_context(message, 20, VThermHvacMode_HEAT)
     assert room.on_percent < 1
     if fault != "stale":
         assert not room.boiler_heat_request(0.9)["pulse_eligible"]
+
+    message["pulse_recovery"] = True
+    room.set_boiler_context(message, 20, VThermHvacMode_HEAT)
+    assert room.pulse_opening == (1.0 if fault == "guard_kick" else None)
+    if fault != "stale":
+        assert room.boiler_heat_request(0.9)["recovery_eligible"] is (fault == "guard_kick")
+
+
+@pytest.mark.parametrize("recovery", [False, True])
+def test_guard_changes_between_equal_full_open_commands(stable_room, recovery):
+    room = stable_room
+    room.set_boiler_context(pulse(1, 1, pulse_recovery=not recovery), 20, VThermHvacMode_HEAT)
+    room.set_boiler_context(pulse(1, 1, pulse_recovery=recovery), 20, VThermHvacMode_HEAT)
+    room.guards._guard_kick_active = True
+    assert room.pulse_opening == (1.0 if recovery else None)
+    room.guards._guard_cut_active = True
+    assert room.pulse_opening is None
+    assert room.on_percent < 1
 
 
 def test_deliberate_coast_holds_integral_across_ticks(stable_room):
